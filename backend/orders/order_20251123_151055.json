@@ -1,0 +1,13 @@
+{
+    "drinkType": "latte",
+    "size": "medium",
+    "milk": "skim",
+    "extras": [
+        "caramel",
+        "extra shot",
+        "extra shot"
+    ],
+    "name": "Sumit",
+    "timestamp": "2025-11-23T15:10:55.814900",
+    "session_id": "session_20251123_151055"
+}
