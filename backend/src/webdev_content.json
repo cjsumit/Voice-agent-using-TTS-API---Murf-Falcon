@@ -1,0 +1,26 @@
+[
+    {
+        "id": "html",
+        "title": "HTML Basics",
+        "summary": "HTML (HyperText Markup Language) is used to structure content on the web using tags like <h1>, <p>, <div>, etc.",
+        "sample_question": "What does HTML stand for and what is its purpose?"
+    },
+    {
+        "id": "css",
+        "title": "CSS Styling",
+        "summary": "CSS (Cascading Style Sheets) is used to style and design websites including layout, colors, and responsiveness.",
+        "sample_question": "What is the role of CSS in web development?"
+    },
+    {
+        "id": "js",
+        "title": "JavaScript",
+        "summary": "JavaScript is a programming language that makes websites interactive. It can modify HTML/CSS dynamically.",
+        "sample_question": "Why is JavaScript important in web development?"
+    },
+    {
+        "id": "frontend",
+        "title": "Frontend Development",
+        "summary": "Frontend development focuses on the client-side of websites \u2014 what users see and interact with.",
+        "sample_question": "Name any two frontend frameworks."
+    }
+]
