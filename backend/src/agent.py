@@ -1,18 +1,22 @@
 # ======================================================
-# 🌐 DAY 4: TEACH-THE-TUTOR (WEB DEVELOPMENT EDITION)  # 🌐 CHANGED FOR WEB DEVELOPMENT
+# 💼 DAY 5: AI SALES DEVELOPMENT REP (SDR)
+# 👨‍💻 "Web Technology Store" - Auto-Lead Capture Agent
+# 🚀 Features: FAQ Retrieval, Lead Qualification, JSON Database
 # ======================================================
 
 import logging
 import json
 import os
 import asyncio
-from typing import Annotated, Literal, Optional
-from dataclasses import dataclass
+from datetime import datetime
+from typing import Annotated, Literal, Optional, List
+from dataclasses import dataclass, asdict
 
-print("\n" + "💻" * 50)  # 🌐 CHANGED FOR WEB DEVELOPMENT
-print("🚀 WEB DEVELOPMENT TUTOR - DAY 4 TUTORIAL")  # 🌐 CHANGED FOR WEB DEVELOPMENT
+print("\n" + "💼" * 50)
+print("🚀 AI SDR AGENT - DAY 5 TUTORIAL")
+print("📚 SELLING: Web Technology Courses")
 print("💡 agent.py LOADED SUCCESSFULLY!")
-print("💻" * 50 + "\n")  # 🌐 CHANGED FOR WEB DEVELOPMENT
+print("💼" * 50 + "\n")
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -36,166 +40,163 @@ logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
 # ======================================================
-# 📚 KNOWLEDGE BASE (WEB DEV DATA)  # 🌐 CHANGED FOR WEB DEVELOPMENT
+# 📂 1. KNOWLEDGE BASE (FAQ)
 # ======================================================
 
-CONTENT_FILE = "webdev_content.json"  # 🌐 CHANGED FOR WEB DEVELOPMENT
+FAQ_FILE = "store_faq.json"
+LEADS_FILE = "leads_db.json"
 
-# 🌐 NEW WEB DEVELOPMENT TOPICS  # 🌐 CHANGED FOR WEB DEVELOPMENT
-DEFAULT_CONTENT = [
-  {
-    "id": "html",
-    "title": "HTML Basics",
-    "summary": "HTML (HyperText Markup Language) is used to structure content on the web using tags like <h1>, <p>, <div>, etc.",
-    "sample_question": "What does HTML stand for and what is its purpose?"
-  },
-  {
-    "id": "css",
-    "title": "CSS Styling",
-    "summary": "CSS (Cascading Style Sheets) is used to style and design websites including layout, colors, and responsiveness.",
-    "sample_question": "What is the role of CSS in web development?"
-  },
-  {
-    "id": "js",
-    "title": "JavaScript",
-    "summary": "JavaScript is a programming language that makes websites interactive. It can modify HTML/CSS dynamically.",
-    "sample_question": "Why is JavaScript important in web development?"
-  },
-  {
-    "id": "frontend",
-    "title": "Frontend Development",
-    "summary": "Frontend development focuses on the client-side of websites — what users see and interact with.",
-    "sample_question": "Name any two frontend frameworks."
-  }
+# Default FAQ data for "Web Technology Store"
+DEFAULT_FAQ = [
+    {
+        "question": "What do you sell?",
+        "answer": "We offer premium courses on Full Stack Web Development, Frontend Development, Backend APIs, and Modern JavaScript frameworks like React and Next.js."
+    },
+    {
+        "question": "How much does the Full Stack course cost?",
+        "answer": "The Professional Full Stack Web Development course is currently priced at $399. It includes React, Node.js, MongoDB, and deployment."
+    },
+    {
+        "question": "Do you offer free content?",
+        "answer": "Yes! We provide free starter lessons and demo classes so students can understand the learning experience before enrolling."
+    },
+    {
+        "question": "Do you offer corporate training?",
+        "answer": "Yes, we provide Web Technology corporate training programs for teams. Pricing depends on team size and training duration."
+    }
 ]
 
-def load_content():
-    """
-    📖 Checks if web dev JSON exists. 
-    If NO: Generates it from DEFAULT_CONTENT.
-    """  # 🌐 CHANGED FOR WEB DEVELOPMENT
+def load_knowledge_base():
+    """Generates FAQ file if missing, then loads it."""
     try:
-        path = os.path.join(os.path.dirname(__file__), CONTENT_FILE)
-        
+        path = os.path.join(os.path.dirname(__file__), FAQ_FILE)
         if not os.path.exists(path):
-            print(f"⚠️ {CONTENT_FILE} not found. Generating web dev data...")  # 🌐 CHANGED FOR WEB DEVELOPMENT
             with open(path, "w", encoding='utf-8') as f:
-                json.dump(DEFAULT_CONTENT, f, indent=4)
-            print("✅ Web Dev content file created successfully.")  # 🌐 CHANGED FOR WEB DEVELOPMENT
-            
+                json.dump(DEFAULT_FAQ, f, indent=4)
         with open(path, "r", encoding='utf-8') as f:
-            data = json.load(f)
-            return data
-            
+            return json.dumps(json.load(f)) # Return as string for the Prompt
     except Exception as e:
-        print(f"⚠️ Error managing content file: {e}")
-        return []
+        print(f"⚠️ Error loading FAQ: {e}")
+        return ""
 
-COURSE_CONTENT = load_content()
+STORE_FAQ_TEXT = load_knowledge_base()
 
 # ======================================================
-# 🧠 STATE MANAGEMENT
+# 💾 2. LEAD DATA STRUCTURE
 # ======================================================
 
 @dataclass
-class TutorState:
-    current_topic_id: str | None = None
-    current_topic_data: dict | None = None
-    mode: Literal["learn", "quiz", "teach_back"] = "learn"
-    
-    def set_topic(self, topic_id: str):
-        topic = next((item for item in COURSE_CONTENT if item["id"] == topic_id), None)
-        if topic:
-            self.current_topic_id = topic_id
-            self.current_topic_data = topic
-            return True
-        return False
+class LeadProfile:
+    name: str | None = None
+    company: str | None = None
+    email: str | None = None
+    role: str | None = None
+    use_case: str | None = None
+    team_size: str | None = None
+    timeline: str | None = None
+   
+    def is_qualified(self):
+        """Returns True if we have the minimum info (Name + Email + Use Case)"""
+        return all([self.name, self.email, self.use_case])
 
 @dataclass
 class Userdata:
-    tutor_state: TutorState
-    agent_session: Optional[AgentSession] = None 
+    lead_profile: LeadProfile
 
 # ======================================================
-# 🛠️ TUTOR TOOLS
+# 🛠️ 3. SDR TOOLS
 # ======================================================
 
 @function_tool
-async def select_topic(
-    ctx: RunContext[Userdata], 
-    topic_id: Annotated[str, Field(description="The ID of the topic to study (HTML, CSS, JS, frontend)")]  # 🌐 CHANGED FOR WEB DEVELOPMENT
-) -> str:
-    state = ctx.userdata.tutor_state
-    success = state.set_topic(topic_id.lower())
-    
-    if success:
-        return f"Topic set to {state.current_topic_data['title']}! Do you want to Learn, take a Quiz, or Teach it back?"
-    else:
-        available = ", ".join([t["id"] for t in COURSE_CONTENT])
-        return f"Topic not found. Available topics: {available}"
-
-@function_tool
-async def set_learning_mode(
-    ctx: RunContext[Userdata], 
-    mode: Annotated[str, Field(description="Mode to switch to: learn, quiz, teach_back")]
-) -> str:
-    
-    state = ctx.userdata.tutor_state
-    state.mode = mode.lower()
-    
-    agent_session = ctx.userdata.agent_session 
-    
-    if agent_session:
-        if state.mode == "learn":
-            agent_session.tts.update_options(voice="en-US-matthew", style="Promo")
-            instruction = f"Explain: {state.current_topic_data['summary']}"
-            
-        elif state.mode == "quiz":
-            agent_session.tts.update_options(voice="en-US-alicia", style="Conversational")
-            instruction = f"Ask: {state.current_topic_data['sample_question']}"
-            
-        elif state.mode == "teach_back":
-            agent_session.tts.update_options(voice="en-US-ken", style="Promo")
-            instruction = "Ask the user to explain the topic in simple words."
-
-        else:
-            return "Invalid mode."
-    else:
-        instruction = "No session found."
-
-    print(f"🔄 SWITCHING MODE -> {state.mode.upper()}")
-    return f"Switched to {state.mode}. {instruction}"
-
-@function_tool
-async def evaluate_teaching(
+async def update_lead_profile(
     ctx: RunContext[Userdata],
-    user_explanation: Annotated[str, Field(description="User explanation")]
+    name: Annotated[Optional[str], Field(description="Customer's name")] = None,
+    company: Annotated[Optional[str], Field(description="Customer's company name")] = None,
+    email: Annotated[Optional[str], Field(description="Customer's email address")] = None,
+    role: Annotated[Optional[str], Field(description="Customer's job title")] = None,
+    use_case: Annotated[Optional[str], Field(description="What they want to build or learn")] = None,
+    team_size: Annotated[Optional[str], Field(description="Number of people in their team")] = None,
+    timeline: Annotated[Optional[str], Field(description="When they want to start (e.g., Now, next month)")] = None,
 ) -> str:
-    print(f"📝 EVALUATING: {user_explanation}")
-    return "Evaluate the explanation, score out of 10, and correct mistakes."
+    """
+    ✍️ Captures lead details provided by the user during conversation.
+    Only call this when the user explicitly provides information.
+    """
+    profile = ctx.userdata.lead_profile
+   
+    if name: profile.name = name
+    if company: profile.company = company
+    if email: profile.email = email
+    if role: profile.role = role
+    if use_case: profile.use_case = use_case
+    if team_size: profile.team_size = team_size
+    if timeline: profile.timeline = timeline
+   
+    print(f"📝 UPDATING LEAD: {profile}")
+    return "Lead profile updated. Continue the conversation."
+
+@function_tool
+async def submit_lead_and_end(
+    ctx: RunContext[Userdata],
+) -> str:
+    """
+    💾 Saves the lead to the database and signals the end of the call.
+    Call this when the user says goodbye or 'that's all'.
+    """
+    profile = ctx.userdata.lead_profile
+   
+    db_path = os.path.join(os.path.dirname(__file__), LEADS_FILE)
+   
+    entry = asdict(profile)
+    entry["timestamp"] = datetime.now().isoformat()
+   
+    existing_data = []
+    if os.path.exists(db_path):
+        try:
+            with open(db_path, "r") as f:
+                existing_data = json.load(f)
+        except: pass
+   
+    existing_data.append(entry)
+   
+    with open(db_path, "w") as f:
+        json.dump(existing_data, f, indent=4)
+       
+    print(f"✅ LEAD SAVED TO {LEADS_FILE}")
+    return f"Lead saved. Summarize the call for the user: 'Thanks {profile.name}, I have your info regarding {profile.use_case}. We will email you at {profile.email}. Goodbye!'"
 
 # ======================================================
-# 🧠 AGENT DEFINITION
+# 🧠 4. AGENT DEFINITION
 # ======================================================
 
-class TutorAgent(Agent):
+class SDRAgent(Agent):
     def __init__(self):
-        topic_list = ", ".join([f"{t['id']} ({t['title']})" for t in COURSE_CONTENT])
-        
         super().__init__(
             instructions=f"""
-            You are a Web Development Tutor.  # 🌐 CHANGED FOR WEB DEVELOPMENT
-            
-            📚 TOPICS: {topic_list}
-            
-            Modes:
-            - Learn → Explain the topic
-            - Quiz → Ask a question
-            - Teach_back → Ask the user to teach you
-            
-            Always ask which topic the user wants first.
+            You are 'Sarah', a friendly and professional Sales Development Rep (SDR) for 'Web Technology Store'.
+           
+            📘 **YOUR KNOWLEDGE BASE (FAQ):**
+            {STORE_FAQ_TEXT}
+           
+            🎯 **YOUR GOAL:**
+            1. Answer questions about our Web Technology courses and corporate training using the FAQ.
+            2. **QUALIFY THE LEAD:** Naturally ask for the following details during the chat:
+               - Name
+               - Company / Role
+               - Email
+               - What are they trying to build? (Use Case)
+               - Timeline (When do they need it?)
+           
+            ⚙️ **BEHAVIOR:**
+            - **Be Conversational:** Don't interrogate the user. Answer a question, THEN ask for a detail.
+            - *Example:* "Our Full Stack course is $399. It's great for teams. By the way, how large is your dev team?"
+            - **Capture Data:** Use `update_lead_profile` immediately when you hear new info.
+            - **Closing:** When the user is done, use `submit_lead_and_end`.
+           
+            🚫 **RESTRICTIONS:**
+            - If you don't know an answer, say "I'll check with my team and email you." (Don't hallucinate prices).
             """,
-            tools=[select_topic, set_learning_mode, evaluate_teaching],
+            tools=[update_lead_profile, submit_lead_and_end],
         )
 
 # ======================================================
@@ -208,29 +209,26 @@ def prewarm(proc: JobProcess):
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    print("\n" + "💻" * 25)  # 🌐 CHANGED FOR WEB DEVELOPMENT
-    print("🚀 STARTING WEB DEV TUTOR SESSION")  # 🌐 CHANGED FOR WEB DEVELOPMENT
-    print(f"📚 Loaded {len(COURSE_CONTENT)} topics!")
-
-    userdata = Userdata(tutor_state=TutorState())
+    print("\n" + "💼" * 25)
+    print("🚀 STARTING SDR SESSION")
+   
+    userdata = Userdata(lead_profile=LeadProfile())
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-matthew", 
-            style="Promo",
+            voice="en-US-natalie",
+            style="Promo",        
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         userdata=userdata,
     )
-    
-    userdata.agent_session = session
-    
+   
     await session.start(
-        agent=TutorAgent(),
+        agent=SDRAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC()
