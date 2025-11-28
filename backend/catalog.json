@@ -1,0 +1,52 @@
+[
+  {
+    "id": "milk-amul-1l",
+    "name": "Amul Taaza Milk",
+    "price": 72
+  },
+  {
+    "id": "paneer-200g",
+    "name": "Amul Malai Paneer",
+    "price": 95
+  },
+  {
+    "id": "butter-100g",
+    "name": "Amul Butter",
+    "price": 58
+  },
+  {
+    "id": "atta-5kg",
+    "name": "Aashirvaad Atta",
+    "price": 245
+  },
+  {
+    "id": "rice-basmati-1kg",
+    "name": "India Gate Basmati Rice",
+    "price": 160
+  },
+  {
+    "id": "dal-toor-1kg",
+    "name": "Tata Toor Dal",
+    "price": 185
+  },
+  {
+    "id": "salt-1kg",
+    "name": "Tata Salt",
+    "price": 28
+  },
+  {
+    "id": "sugar-1kg",
+    "name": "Madhur Sugar",
+    "price": 60
+  },
+  {
+    "id": "maggi-masala",
+    "name": "Maggi Noodles",
+    "price": 14
+  },
+  {
+    "id": "tea-250g",
+    "name": "Red Label Tea",
+    "price": 140
+  }
+]
