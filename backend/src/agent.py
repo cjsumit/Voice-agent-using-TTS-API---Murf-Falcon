@@ -1,609 +1,501 @@
-# IMPROVE THE AGENT AS PER YOUR NEED 1
-"""
-Day 8 – Voice Game Master (D&D-Style Adventure) - Voice-only GM agent
-
-- Uses LiveKit agent plumbing similar to the provided food_agent_sqlite example.
-- GM persona, universe, tone and rules are encoded in the agent instructions.
-- Keeps STT/TTS/Turn detector/VAD integration untouched (murf, deepgram, silero, turn_detector).
-- Tools:
-    - start_adventure(): start a fresh session and introduce the scene
-    - get_scene(): return the current scene description (GM text) ending with "What do you do?"
-    - player_action(action_text): accept player's spoken action, update state, advance scene
-    - show_journal(): list remembered facts, NPCs, named locations, choices
-    - restart_adventure(): reset state and start over
-- Userdata keeps continuity between turns: history, inventory, named NPCs/locations, choices, current_scene
-"""
-
-import json
 import logging
-import os
-import asyncio
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import List, Dict, Optional, Annotated
+from typing import Annotated, Optional, Union
+from pydantic import Field
 
 from dotenv import load_dotenv
-from pydantic import Field
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
+    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
     function_tool,
+    metrics,
+    tokenize,
     RunContext,
 )
-
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# -------------------------
-# Logging
-# -------------------------
-logger = logging.getLogger("voice_game_master")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-logger.addHandler(handler)
+from commerce import (
+    get_products, 
+    create_order, 
+    get_last_order, 
+    get_all_orders,
+    find_product_by_name,
+    add_to_cart,
+    get_cart,
+    remove_from_cart,
+    clear_cart,
+    checkout_cart,
+)
+
+logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# -------------------------
-# Simple Game World Definition
-# -------------------------
-# A compact world with a few scenes and choices forming a mini-arc.
-WORLD = {
-    "intro": {
-        "title": "A Shadow over Brinmere",
-        "desc": (
-            "You awake on the damp shore of Brinmere, the moon a thin silver crescent. "
-            "A ruined watchtower smolders a short distance inland, and a narrow path leads "
-            "towards a cluster of cottages to the east. In the water beside you lies a "
-            "small, carved wooden box, half-buried in sand."
-        ),
-        "choices": {
-            "inspect_box": {
-                "desc": "Inspect the carved wooden box at the water's edge.",
-                "result_scene": "box",
-            },
-            "approach_tower": {
-                "desc": "Head inland towards the smoldering watchtower.",
-                "result_scene": "tower",
-            },
-            "walk_to_cottages": {
-                "desc": "Follow the path east towards the cottages.",
-                "result_scene": "cottages",
-            },
-        },
-    },
-    "box": {
-        "title": "The Box",
-        "desc": (
-            "The box is warm despite the night air. Inside is a folded scrap of parchment "
-            "with a hatch-marked map and the words: 'Beneath the tower, the latch sings.' "
-            "As you read, a faint whisper seems to come from the tower, as if the wind "
-            "itself speaks your name."
-        ),
-        "choices": {
-            "take_map": {
-                "desc": "Take the map and keep it.",
-                "result_scene": "tower_approach",
-                "effects": {"add_journal": "Found map fragment: 'Beneath the tower, the latch sings.'"},
-            },
-            "leave_box": {
-                "desc": "Leave the box where it is.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "tower": {
-        "title": "The Watchtower",
-        "desc": (
-            "The watchtower's stonework is cracked and warm embers glow within. An iron "
-            "latch covers a hatch at the base — it looks old but recently used. You can "
-            "try the latch, look for other entrances, or retreat."
-        ),
-        "choices": {
-            "try_latch_without_map": {
-                "desc": "Try the iron latch without any clue.",
-                "result_scene": "latch_fail",
-            },
-            "search_around": {
-                "desc": "Search the nearby rubble for another entrance.",
-                "result_scene": "secret_entrance",
-            },
-            "retreat": {
-                "desc": "Step back to the shoreline.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "tower_approach": {
-        "title": "Toward the Tower",
-        "desc": (
-            "Clutching the map, you approach the watchtower. The map's marks align with "
-            "the hatch at the base, and you notice a faint singing resonance when you step close."
-        ),
-        "choices": {
-            "open_hatch": {
-                "desc": "Use the map clue and try the hatch latch carefully.",
-                "result_scene": "latch_open",
-                "effects": {"add_journal": "Used map clue to open the hatch."},
-            },
-            "search_around": {
-                "desc": "Search for another entrance.",
-                "result_scene": "secret_entrance",
-            },
-            "retreat": {
-                "desc": "Return to the shore.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "latch_fail": {
-        "title": "A Bad Twist",
-        "desc": (
-            "You twist the latch without heed — the mechanism sticks, and the effort sends "
-            "a shiver through the ground. From inside the tower, something rustles in alarm."
-        ),
-        "choices": {
-            "run_away": {
-                "desc": "Run back to the shore.",
-                "result_scene": "intro",
-            },
-            "stand_ground": {
-                "desc": "Stand and prepare for whatever emerges.",
-                "result_scene": "tower_combat",
-            },
-        },
-    },
-    "latch_open": {
-        "title": "The Hatch Opens",
-        "desc": (
-            "With the map's guidance the latch yields and the hatch opens with a breath of cold air. "
-            "Inside, a spiral of rough steps leads down into an ancient cellar lit by phosphorescent moss."
-        ),
-        "choices": {
-            "descend": {
-                "desc": "Descend into the cellar.",
-                "result_scene": "cellar",
-            },
-            "close_hatch": {
-                "desc": "Close the hatch and reconsider.",
-                "result_scene": "tower_approach",
-            },
-        },
-    },
-    "secret_entrance": {
-        "title": "A Narrow Gap",
-        "desc": (
-            "Behind a pile of rubble you find a narrow gap and old rope leading downward. "
-            "It smells of cold iron and something briny."
-        ),
-        "choices": {
-            "squeeze_in": {
-                "desc": "Squeeze through the gap and follow the rope down.",
-                "result_scene": "cellar",
-            },
-            "mark_and_return": {
-                "desc": "Mark the spot and return to the shore.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "cellar": {
-        "title": "Cellar of Echoes",
-        "desc": (
-            "The cellar opens into a circular chamber where runes glow faintly. At the center "
-            "is a stone plinth and upon it a small brass key and a sealed scroll."
-        ),
-        "choices": {
-            "take_key": {
-                "desc": "Pick up the brass key.",
-                "result_scene": "cellar_key",
-                "effects": {"add_inventory": "brass_key", "add_journal": "Found brass key on plinth."},
-            },
-            "open_scroll": {
-                "desc": "Break the seal and read the scroll.",
-                "result_scene": "scroll_reveal",
-                "effects": {"add_journal": "Scroll reads: 'The tide remembers what the villagers forget.'"},
-            },
-            "leave_quietly": {
-                "desc": "Leave the cellar and close the hatch behind you.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "cellar_key": {
-        "title": "Key in Hand",
-        "desc": (
-            "With the key in your hand the runes dim and a hidden panel slides open, revealing a "
-            "small statue that begins to hum. A voice, ancient and kind, asks: 'Will you return what was taken?'"
-        ),
-        "choices": {
-            "pledge_help": {
-                "desc": "Pledge to return what was taken.",
-                "result_scene": "reward",
-                "effects": {"add_journal": "You pledged to return what was taken."},
-            },
-            "refuse": {
-                "desc": "Refuse and pocket the key.",
-                "result_scene": "cursed_key",
-                "effects": {"add_journal": "You pocketed the key; a weight grows in your pocket."},
-            },
-        },
-    },
-    "scroll_reveal": {
-        "title": "The Scroll",
-        "desc": (
-            "The scroll tells of an heirloom taken by a water spirit that dwells beneath the tower. "
-            "It hints that the brass key 'speaks' when offered with truth."
-        ),
-        "choices": {
-            "search_for_key": {
-                "desc": "Search the plinth for a key.",
-                "result_scene": "cellar_key",
-            },
-            "leave_quietly": {
-                "desc": "Leave the cellar and keep the knowledge to yourself.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "tower_combat": {
-        "title": "Something Emerges",
-        "desc": (
-            "A hunched, brine-soaked creature scrambles out from the tower. Its eyes glow with hunger. "
-            "You must act quickly."
-        ),
-        "choices": {
-            "fight": {
-                "desc": "Fight the creature.",
-                "result_scene": "fight_win",
-            },
-            "flee": {
-                "desc": "Flee back to the shore.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "fight_win": {
-        "title": "After the Scuffle",
-        "desc": (
-            "You manage to fend off the creature; it flees wailing towards the sea. On the ground lies "
-            "a small locket engraved with a crest — likely the heirloom mentioned in the scroll."
-        ),
-        "choices": {
-            "take_locket": {
-                "desc": "Take the locket and examine it.",
-                "result_scene": "reward",
-                "effects": {"add_inventory": "engraved_locket", "add_journal": "Recovered an engraved locket."},
-            },
-            "leave_locket": {
-                "desc": "Leave the locket and tend to your wounds.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "reward": {
-        "title": "A Minor Resolution",
-        "desc": (
-            "A small sense of peace settles over Brinmere. Villagers may one day know the heirloom is found, or it may remain a secret. "
-            "You feel the night shift; the little arc of your story here closes for now."
-        ),
-        "choices": {
-            "end_session": {
-                "desc": "End the session and return to the shore (conclude mini-arc).",
-                "result_scene": "intro",
-            },
-            "keep_exploring": {
-                "desc": "Keep exploring for more mysteries.",
-                "result_scene": "intro",
-            },
-        },
-    },
-    "cursed_key": {
-        "title": "A Weight in the Pocket",
-        "desc": (
-            "The brass key glows coldly. You feel a heavy sorrow that tugs at your thoughts. "
-            "Perhaps the key demands something in return..."
-        ),
-        "choices": {
-            "seek_redemption": {
-                "desc": "Seek a way to make amends.",
-                "result_scene": "reward",
-            },
-            "bury_key": {
-                "desc": "Bury the key and hope the weight fades.",
-                "result_scene": "intro",
-            },
-        },
-    },
-}
 
-# -------------------------
-# Per-session Userdata
-# -------------------------
-@dataclass
-class Userdata:
-    player_name: Optional[str] = None
-    current_scene: str = "intro"
-    history: List[Dict] = field(default_factory=list)  # list of {'scene', 'action', 'time', 'result_scene'}
-    journal: List[str] = field(default_factory=list)
-    inventory: List[str] = field(default_factory=list)
-    named_npcs: Dict[str, str] = field(default_factory=dict)
-    choices_made: List[str] = field(default_factory=list)
-    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
-
-# -------------------------
-# Helper functions
-# -------------------------
-def scene_text(scene_key: str, userdata: Userdata) -> str:
-    """
-    Build the descriptive text for the current scene, and append choices as short hints.
-    Always end with 'What do you do?' so the voice flow prompts player input.
-    """
-    scene = WORLD.get(scene_key)
-    if not scene:
-        return "You are in a featureless void. What do you do?"
-
-    desc = f"{scene['desc']}\n\nChoices:\n"
-    for cid, cmeta in scene.get("choices", {}).items():
-        desc += f"- {cmeta['desc']} (say: {cid})\n"
-    # GM MUST end with the action prompt
-    desc += "\nWhat do you do?"
-    return desc
-
-def apply_effects(effects: dict, userdata: Userdata):
-    if not effects:
-        return
-    if "add_journal" in effects:
-        userdata.journal.append(effects["add_journal"])
-    if "add_inventory" in effects:
-        userdata.inventory.append(effects["add_inventory"])
-    # Extendable for more effect keys
-
-def summarize_scene_transition(old_scene: str, action_key: str, result_scene: str, userdata: Userdata) -> str:
-    """Record the transition into history and return a short narrative the GM can use."""
-    entry = {
-        "from": old_scene,
-        "action": action_key,
-        "to": result_scene,
-        "time": datetime.utcnow().isoformat() + "Z",
-    }
-    userdata.history.append(entry)
-    userdata.choices_made.append(action_key)
-    return f"You chose '{action_key}'."
-
-# -------------------------
-# Agent Tools (function_tool)
-# -------------------------
-
-@function_tool
-async def start_adventure(
-    ctx: RunContext[Userdata],
-    player_name: Annotated[Optional[str], Field(description="Player name", default=None)] = None,
-) -> str:
-    """Initialize a new adventure session for the player and return the opening description."""
-    userdata = ctx.userdata
-    if player_name:
-        userdata.player_name = player_name
-    userdata.current_scene = "intro"
-    userdata.history = []
-    userdata.journal = []
-    userdata.inventory = []
-    userdata.named_npcs = {}
-    userdata.choices_made = []
-    userdata.session_id = str(uuid.uuid4())[:8]
-    userdata.started_at = datetime.utcnow().isoformat() + "Z"
-
-    opening = (
-        f"Greetings {userdata.player_name or 'traveler'}. Welcome to '{WORLD['intro']['title']}'.\n\n"
-        + scene_text("intro", userdata)
-    )
-    # Ensure GM prompt present
-    if not opening.endswith("What do you do?"):
-        opening += "\nWhat do you do?"
-    return opening
-
-@function_tool
-async def get_scene(
-    ctx: RunContext[Userdata],
-) -> str:
-    """Return the current scene description (useful for 'remind me where I am')."""
-    userdata = ctx.userdata
-    scene_k = userdata.current_scene or "intro"
-    txt = scene_text(scene_k, userdata)
-    return txt
-
-@function_tool
-async def player_action(
-    ctx: RunContext[Userdata],
-    action: Annotated[str, Field(description="Player spoken action or the short action code (e.g., 'inspect_box' or 'take the box')")],
-) -> str:
-    """
-    Accept player's action (natural language or action key), try to resolve it to a defined choice,
-    update userdata, advance to the next scene and return the GM's next description (ending with 'What do you do?').
-    """
-    userdata = ctx.userdata
-    current = userdata.current_scene or "intro"
-    scene = WORLD.get(current)
-    action_text = (action or "").strip()
-
-    # Attempt 1: match exact action key (e.g., 'inspect_box')
-    chosen_key = None
-    if action_text.lower() in (scene.get("choices") or {}):
-        chosen_key = action_text.lower()
-
-    # Attempt 2: fuzzy match by checking if action_text contains the choice key or descriptive words
-    if not chosen_key:
-        # try to find a choice whose description words appear in action_text
-        for cid, cmeta in (scene.get("choices") or {}).items():
-            desc = cmeta.get("desc", "").lower()
-            if cid in action_text.lower() or any(w in action_text.lower() for w in desc.split()[:4]):
-                chosen_key = cid
-                break
-
-    # Attempt 3: fallback by simple keyword matching against choice descriptions
-    if not chosen_key:
-        for cid, cmeta in (scene.get("choices") or {}).items():
-            for keyword in cmeta.get("desc", "").lower().split():
-                if keyword and keyword in action_text.lower():
-                    chosen_key = cid
-                    break
-            if chosen_key:
-                break
-
-    if not chosen_key:
-        # If we still can't resolve, ask a clarifying GM response but keep it short and end with prompt.
-        resp = (
-            "I didn't quite catch that action for this situation. Try one of the listed choices or use a simple phrase like 'inspect the box' or 'go to the tower'.\n\n"
-            + scene_text(current, userdata)
-        )
-        return resp
-
-    # Apply the chosen choice
-    choice_meta = scene["choices"].get(chosen_key)
-    result_scene = choice_meta.get("result_scene", current)
-    effects = choice_meta.get("effects", None)
-
-    # Apply effects (inventory/journal, etc.)
-    apply_effects(effects or {}, userdata)
-
-    # Record transition
-    _note = summarize_scene_transition(current, chosen_key, result_scene, userdata)
-
-    # Update current scene
-    userdata.current_scene = result_scene
-
-    # Build narrative reply: echo a short confirmation, then describe next scene
-    next_desc = scene_text(result_scene, userdata)
-
-    # A small flourish so the GM sounds more persona-driven
-    persona_pre = (
-        "The Game Master (a calm, slightly mysterious narrator) replies:\n\n"
-    )
-    reply = f"{persona_pre}{_note}\n\n{next_desc}"
-    # ensure final prompt present
-    if not reply.endswith("What do you do?"):
-        reply += "\nWhat do you do?"
-    return reply
-
-@function_tool
-async def show_journal(
-    ctx: RunContext[Userdata],
-) -> str:
-    userdata = ctx.userdata
-    lines = []
-    lines.append(f"Session: {userdata.session_id} | Started at: {userdata.started_at}")
-    if userdata.player_name:
-        lines.append(f"Player: {userdata.player_name}")
-    if userdata.journal:
-        lines.append("\nJournal entries:")
-        for j in userdata.journal:
-            lines.append(f"- {j}")
-    else:
-        lines.append("\nJournal is empty.")
-    if userdata.inventory:
-        lines.append("\nInventory:")
-        for it in userdata.inventory:
-            lines.append(f"- {it}")
-    else:
-        lines.append("\nNo items in inventory.")
-    lines.append("\nRecent choices:")
-    for h in userdata.history[-6:]:
-        lines.append(f"- {h['time']} | from {h['from']} -> {h['to']} via {h['action']}")
-    lines.append("\nWhat do you do?")
-    return "\n".join(lines)
-
-@function_tool
-async def restart_adventure(
-    ctx: RunContext[Userdata],
-) -> str:
-    """Reset the userdata and start again."""
-    userdata = ctx.userdata
-    userdata.current_scene = "intro"
-    userdata.history = []
-    userdata.journal = []
-    userdata.inventory = []
-    userdata.named_npcs = {}
-    userdata.choices_made = []
-    userdata.session_id = str(uuid.uuid4())[:8]
-    userdata.started_at = datetime.utcnow().isoformat() + "Z"
-    greeting = (
-        "The world resets. A new tide laps at the shore. You stand once more at the beginning.\n\n"
-        + scene_text("intro", userdata)
-    )
-    if not greeting.endswith("What do you do?"):
-        greeting += "\nWhat do you do?"
-    return greeting
-
-# -------------------------
-# The Agent (GameMasterAgent)
-# -------------------------
-class GameMasterAgent(Agent):
-    def __init__(self):
-        # System instructions define Universe, Tone, Role
-        instructions = """
-        You are 'Aurek', the Game Master (GM) for a voice-only, Dungeons-and-Dragons-style short adventure.
-        Universe: Low-magic coastal fantasy (village of Brinmere, tide-smoothed ruins, minor spirits).
-        Tone: Slightly mysterious, dramatic, empathetic (not overly scary).
-        Role: You are the GM. You describe scenes vividly, remember the player's past choices, named NPCs, inventory and locations,
-              and you always end your descriptive messages with the prompt: 'What do you do?'
-        Rules:
-            - Use the provided tools to start the adventure, get the current scene, accept the player's spoken action,
-              show the player's journal, or restart the adventure.
-            - Keep continuity using the per-session userdata. Reference journal items and inventory when relevant.
-            - Drive short sessions (aim for several meaningful turns). Each GM message MUST end with 'What do you do?'.
-            - Respect that this agent is voice-first: responses should be concise enough for spoken delivery but evocative.
-        """
+class Assistant(Agent):
+    def __init__(self) -> None:
         super().__init__(
-            instructions=instructions,
-            tools=[start_adventure, get_scene, player_action, show_journal, restart_adventure],
+            instructions="""You are an Amazon shopping assistant. Concise, helpful. You can browse products and place orders. Always summarize the order price before confirming.
+            
+            You have access to these function tools:
+            - browse_products: Search, filter, and SORT products in the catalog. Use this when users ask about products, want to see items, browse the catalog, or request sorting. The browse_products function supports sorting with sort_by parameter: "price_asc" (cheapest first), "price_desc" (most expensive first), "rating_desc" (highest rated first), "name_asc" (A-Z), "name_desc" (Z-A). When users ask to sort, order by price, show cheapest/most expensive, or highest rated, ALWAYS use the sort_by parameter in browse_products.
+            - place_order: Place an order for a product. Always confirm the total price in INR before finalizing.
+            - get_last_order_info: Get information about the user's last order.
+            - add_to_cart: Add products to shopping cart. Use this when users want to add items to their cart.
+            - view_cart: View current cart contents. ALWAYS call this function when users ask "what's in my cart", "show my cart", "what did I add", or any question about their shopping cart.
+            - remove_from_cart: Remove items from cart. ALWAYS call this function when users ask to remove, delete, or take out items from their cart. Use the product name the user mentions.
+            - checkout_cart: Complete purchase from cart. Use this when users want to buy everything in their cart.
+            - get_order_history: View all past orders.
+            - get_product_details: Get detailed information about a specific product.
+            
+            When users ask about products, immediately call browse_products. When they want to buy something, use place_order or checkout_cart. 
+            When users ask about their cart (e.g., "what's in my cart", "show my cart"), ALWAYS call view_cart first.
+            When users want to remove items from cart, ALWAYS call remove_from_cart with the product name they mention.
+            When users ask to sort products (e.g., "sort by price", "show cheapest", "most expensive", "highest rated"), ALWAYS call browse_products with the appropriate sort_by parameter. DO NOT say you can't sort - you can sort using browse_products with sort_by parameter.
+            Always mention prices in Indian Rupees (₹).""",
         )
+    
 
-# -------------------------
-# Entrypoint & Prewarm (keeps speech functionality)
-# -------------------------
+    @function_tool(description="Search and filter products from the catalog. All parameters are optional - provide only what you need.")
+    async def browse_products(
+        self,
+        context: RunContext,
+        search_term: Annotated[
+            Optional[str],
+            Field(description="Search by product name or keyword", default="")
+        ] = "",
+        category: Annotated[
+            Optional[str],
+            Field(description="Filter by category", default="")
+        ] = "",
+        max_price: Annotated[
+            Optional[int],
+            Field(description="Maximum price in INR", default=0)
+        ] = 0,
+        min_price: Annotated[
+            Optional[int],
+            Field(description="Minimum price in INR", default=0)
+        ] = 0,
+        sort_by: Annotated[
+            Optional[str],
+            Field(description="Sort option: price_asc, price_desc, rating_desc, name_asc", default="")
+        ] = "",
+    ) -> str:
+        """
+        Browse and filter products by search term, category, price range, or sorting preference.
+        
+        ALL PARAMETERS ARE OPTIONAL. You can provide any combination of:
+        - search_term: Search by product name or keyword (e.g., "camera", "echo")
+        - category: Filter by category (e.g., "electronics", "tablets", "smart-home")
+        - max_price: Maximum price in INR (e.g., 10000, 50000)
+        - min_price: Minimum price in INR
+        - sort_by: Sort option - "price_asc" (low to high), "price_desc" (high to low), "rating_desc" (best rated), "name_asc" (alphabetical)
+        
+        Examples:
+        - browse_products(search_term="camera") → finds all cameras
+        - browse_products(max_price=30000) → products under ₹30,000
+        - browse_products(search_term="sony", category="electronics") → Sony products in electronics
+        - browse_products(sort_by="price_asc") → cheapest products first
+        - browse_products(search_term="camera", max_price=10000) → cameras under ₹10,000
+        """
+        try:
+            logger.info(
+                f"browse_products called with: search_term={search_term}, "
+                f"category={category}, max_price={max_price}, min_price={min_price}, "
+                f"sort_by={sort_by}"
+            )
+
+            # Normalize empty strings and 0 to None for optional parameters
+            # This allows the LLM to omit parameters without validation errors
+            search_term = str(search_term).strip() if search_term else None
+            category = str(category).strip().lower() if category else None
+            max_price = int(max_price) if max_price and max_price > 0 else None
+            min_price = int(min_price) if min_price and min_price > 0 else None
+            sort_by = str(sort_by).strip() if sort_by else None
+            
+            # Call commerce layer with all parameters (handles None correctly)
+            filtered_products = get_products(
+                search_term=search_term,
+                category=category,
+                max_price=max_price,
+                min_price=min_price,
+                sort_by=sort_by
+            )
+
+            logger.info(f"Found {len(filtered_products)} products")
+
+            if not filtered_products:
+                return "Sorry, I couldn't find any products matching your criteria."
+
+            # ✅ Send filter metadata to frontend via LiveKit data channel
+            # This keeps the UI in sync with what the agent found
+            # Only include non-empty parameters
+            filter_params = []
+            if search_term and search_term.strip():
+                filter_params.append(f"search_term={search_term.strip()}")
+            if category and category.strip():
+                filter_params.append(f"category={category.strip()}")
+            if max_price and max_price > 0:
+                filter_params.append(f"max_price={max_price}")
+            if min_price and min_price > 0:
+                filter_params.append(f"min_price={min_price}")
+            if sort_by and sort_by.strip() and sort_by.strip() != 'default':
+                filter_params.append(f"sort_by={sort_by.strip()}")
+            
+            if filter_params:
+                filter_message = f"[FILTER:{'&'.join(filter_params)}]"
+                
+                try:
+                    import asyncio
+                    async def send_metadata():
+                        try:
+                            await context.room.local_participant.publish_data(
+                                filter_message.encode("utf-8"),
+                                topic="chat",
+                                reliable=True
+                            )
+                            logger.info(f"✅ Filter metadata sent to frontend: {filter_message}")
+                        except Exception as e:
+                            logger.warning(f"❌ Could not send metadata via data channel: {e}", exc_info=True)
+                    
+                    # Don't await - run in background
+                    asyncio.create_task(send_metadata())
+                except Exception as e:
+                    logger.warning(f"❌ Could not create metadata send task: {e}", exc_info=True)
+            else:
+                logger.info("ℹ️ No filter parameters to send (all empty)")
+
+            # Format response for agent to speak
+            product_names = ", ".join([
+                f"*{p['name']}* (₹{p['price']})"
+                for p in filtered_products[:5]
+            ])
+
+            return (
+                f"Found {len(filtered_products)} products. "
+                f"Here are some options: {product_names}"
+            )
+        except Exception as e:
+            logger.error("=" * 50)
+            logger.error(f"❌ ERROR in browse_products: {e}", exc_info=True)
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error details - search_term={search_term!r} (type: {type(search_term)}), category={category!r} (type: {type(category)}), max_price={max_price} (type: {type(max_price)}), min_price={min_price} (type: {type(min_price)}), sort_by={sort_by!r} (type: {type(sort_by)})")
+            logger.error("=" * 50)
+            # Return a user-friendly error message
+            return f"I encountered an error while searching for products: {str(e)}. Please try again with simpler search terms."
+
+    @function_tool(description="Place an order for a product")
+    async def place_order(
+        self,
+        context: RunContext,
+        product_name_or_id: str,
+        quantity: Optional[int] = 1,
+    ) -> str:
+        """
+        Place a new order for a product.
+        
+        Example: place_order(product_name_or_id="Echo Dot", quantity=2)
+        """
+        logger.info(f"Placing order: product_name_or_id={product_name_or_id}, quantity={quantity}")
+
+        # Try to find product by name first
+        product = find_product_by_name(product_name_or_id)
+        
+        if product:
+            product_id = product["id"]
+            logger.info(f"Found product by name: {product_name_or_id} -> {product_id}")
+        else:
+            # Assume it's already a product ID
+            product_id = product_name_or_id
+            logger.info(f"Using as product ID: {product_id}")
+
+        try:
+            order = create_order(product_id=product_id, quantity=quantity)
+            logger.info(f"Order created successfully: {order['id']}")
+            return f"Order confirmed! Order ID: {order['id']}. You ordered {quantity}x {order['items'][0]['product_name']} for a total of ₹{order['total']:,} {order['currency']}. Your order has been placed and will appear in the Live Order Status panel. Thank you for your purchase!"
+        except ValueError as e:
+            # If product ID lookup failed, try one more time with name search
+            product = find_product_by_name(product_name_or_id)
+            if product:
+                try:
+                    order = create_order(product_id=product["id"], quantity=quantity)
+                    return f"Order confirmed! Order ID: {order['id']}. You ordered {quantity}x {order['items'][0]['product_name']} for a total of ₹{order['total']:,} {order['currency']}. Thank you for your purchase!"
+                except ValueError as ve:
+                    logger.error(f"Error creating order: {ve}")
+                    return f"I found the product '{product['name']}' but couldn't create the order. Please try again."
+            logger.error(f"Product not found: {product_name_or_id}, error: {e}")
+            return f"I couldn't find a product matching '{product_name_or_id}'. Please try using the exact product name or browse products first to see available items."
+        except Exception as e:
+            logger.error(f"Unexpected error in place_order: {e}", exc_info=True)
+            return f"I encountered an error while processing your order. Please try again or browse products first to see available items."
+
+    @function_tool(description="View your most recent order")
+    async def get_last_order_info(self, context: RunContext) -> str:
+        """Get information about your most recent order."""
+        logger.info("Getting last order info")
+
+        try:
+            order = get_last_order()
+            if not order:
+                return "You haven't placed any orders yet."
+
+            items_summary = ", ".join([
+                f"{item['quantity']}x {item['product_name']}"
+                for item in order.get('items', [])
+            ])
+
+            return (
+                f"📦 Your Last Order:\n"
+                f"Order ID: {order['id']}\n"
+                f"Items: {items_summary}\n"
+                f"Total: ₹{order['total']:,}\n"
+                f"Status: {order['status']}\n"
+                f"Placed: {order['created_at']}"
+            )
+        except Exception as e:
+            logger.error(f"Error getting last order: {str(e)}")
+            return "Sorry, I couldn't retrieve your order."
+
+    @function_tool(description="View your order history")
+    async def get_order_history(
+        self,
+        context: RunContext,
+        limit: Optional[int] = 5,
+    ) -> str:
+        """Get your recent orders."""
+        logger.info("Getting order history")
+
+        orders = get_all_orders()
+        if not orders:
+            return "You have no orders yet."
+
+        recent = orders[-limit:] if limit else orders
+        
+        order_summary = "\n".join([
+            f"  • Order #{i+1}: {order['id']} → ₹{order['total']:,} ({order['status']})"
+            for i, order in enumerate(reversed(recent))
+        ])
+        
+        return f"📜 Your Recent Orders:\n{order_summary}"
+
+    @function_tool(description="Add a product to your shopping cart")
+    async def add_to_cart(
+        self,
+        context: RunContext,
+        product_name_or_id: str,
+        quantity: Optional[int] = 1,
+    ) -> str:
+        """Add items to your cart."""
+        logger.info(f"Adding to cart: product_name_or_id={product_name_or_id}, quantity={quantity}")
+
+        # Find product by name
+        product = find_product_by_name(product_name_or_id)
+        if not product:
+            return f"I couldn't find a product matching '{product_name_or_id}'. Please browse products first to see available items."
+
+        try:
+            result = add_to_cart(product["id"], quantity)
+            cart = result["cart"]
+            total = sum(item["unit_amount"] * item["quantity"] for item in cart)
+            return f"{result['message']}. Your cart now has {len(cart)} item(s) with a total of ₹{total:,}."
+        except Exception as e:
+            logger.error(f"Error adding to cart: {e}", exc_info=True)
+            return f"I encountered an error adding '{product_name_or_id}' to your cart. Please try again."
+
+    @function_tool(description="View your shopping cart")
+    async def view_cart(self, context: RunContext) -> str:
+        """Get current cart contents and total."""
+        logger.info("Viewing cart")
+
+        cart = get_cart()
+        if not cart or len(cart) == 0:
+            return "Your cart is empty. Add some products to get started!"
+
+        items_summary = "\n".join([
+            f"  • {item['quantity']}x {item['product_name']} @ ₹{item['unit_amount']} each = ₹{item['quantity'] * item['unit_amount']:,}"
+            for item in cart
+        ])
+
+        total = sum(item['quantity'] * item['unit_amount'] for item in cart)
+
+        return f"🛒 Cart Contents:\n{items_summary}\n\nTotal: ₹{total:,}"
+
+    @function_tool(description="Remove a product from your cart")
+    async def remove_from_cart(
+        self,
+        context: RunContext,
+        product_name_or_id: str,
+    ) -> str:
+        """Remove an item from your shopping cart."""
+        logger.info(f"Removing from cart: product_name_or_id={product_name_or_id}")
+
+        # Find product by name
+        product = find_product_by_name(product_name_or_id)
+        if not product:
+            return f"I couldn't find a product matching '{product_name_or_id}' in your cart."
+
+        try:
+            result = remove_from_cart(product["id"])
+            cart = result["cart"]
+            if cart:
+                total = sum(item["unit_amount"] * item["quantity"] for item in cart)
+                return f"{result['message']}. Your cart now has {len(cart)} item(s) with a total of ₹{total:,}."
+            else:
+                return f"{result['message']}. Your cart is now empty."
+        except Exception as e:
+            logger.error(f"Error removing from cart: {e}", exc_info=True)
+            return f"I encountered an error removing '{product_name_or_id}' from your cart. Please try again."
+
+    @function_tool(description="Checkout and place order from your cart")
+    async def checkout_cart(self, context: RunContext) -> str:
+        """Convert cart to order and proceed with checkout."""
+        logger.info("Checking out cart")
+
+        try:
+            cart = get_cart()
+            if not cart or len(cart) == 0:
+                return "Your cart is empty. Add products before checkout."
+
+            order = checkout_cart()
+            logger.info(f"Checkout completed: {order['id']}")
+
+            items_count = sum(item['quantity'] for item in order['items'])
+            return (
+                f"✅ Checkout successful!\n"
+                f"Order ID: {order['id']}\n"
+                f"Items: {items_count}\n"
+                f"Total: ₹{order['total']:,}\n"
+                f"Status: {order['status']}"
+            )
+        except Exception as e:
+            logger.error(f"Error during checkout: {str(e)}")
+            return "Sorry, checkout failed. Please try again."
+
+    @function_tool(description="Get detailed information about a product")
+    async def get_product_details(
+        self,
+        context: RunContext,
+        product_name_or_id: str,
+    ) -> str:
+        """Get complete details about a specific product."""
+        logger.info(f"Getting product details: product_name_or_id={product_name_or_id}")
+
+        try:
+            product = find_product_by_name(product_name_or_id)
+            if not product:
+                return f"Product not found."
+
+            return (
+                f"📦 {product['name']}\n"
+                f"💵 Price: ₹{product['price']:,}\n"
+                f"📂 Category: {product['category']}\n"
+                f"⭐ Rating: {product['rating']}/5 ({product['reviews']:,} reviews)\n"
+                f"📝 Description: {product['description']}"
+            )
+        except Exception as e:
+            logger.error(f"Error getting product details: {str(e)}")
+            return "Sorry, I couldn't retrieve product details."
+
+
 def prewarm(proc: JobProcess):
-    # load VAD model and stash on process userdata, try/catch like original file
-    try:
-        proc.userdata["vad"] = silero.VAD.load()
-    except Exception:
-        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
+    proc.userdata["vad"] = silero.VAD.load()
+
 
 async def entrypoint(ctx: JobContext):
-    ctx.log_context_fields = {"room": ctx.room.name}
-    logger.info("\n" + "🎲" * 8)
-    logger.info("🚀 STARTING VOICE GAME MASTER (Brinmere Mini-Arc)")
+    # Logging setup
+    # Add any other context you want in all log entries here
+    ctx.log_context_fields = {
+        "room": ctx.room.name,
+    }
 
-    userdata = Userdata()
-
+    # Set up a voice AI pipeline using OpenAI, Cartesia, AssemblyAI, and the LiveKit turn detector
     session = AgentSession(
+        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
+        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(model="gemini-2.5-flash"),
+        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
+        # See all available models at https://docs.livekit.io/agents/models/llm/
+        llm=google.LLM(
+                model="gemini-2.5-flash",
+            ),
+        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
+        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
         tts=murf.TTS(
-            voice="en-US-marcus",
-            style="Conversational",
+            voice="en-US-matthew", 
+            style="Conversation",
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
             text_pacing=True,
         ),
+        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
+        # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata.get("vad"),
-        userdata=userdata,
+        vad=ctx.proc.userdata["vad"],
+        # allow the LLM to generate a response while waiting for the end of turn
+        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
+        preemptive_generation=True,
     )
 
-    # Start the agent session with the GameMasterAgent
+    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
+    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
+    # 1. Install livekit-agents[openai]
+    # 2. Set OPENAI_API_KEY in .env.local
+    # 3. Add `from livekit.plugins import openai` to the top of this file
+    # 4. Use the following session setup instead of the version above
+    # session = AgentSession(
+    #     llm=openai.realtime.RealtimeModel(voice="marin")
+    # )
+
+    # Metrics collection, to measure pipeline performance
+    # For more information, see https://docs.livekit.io/agents/build/metrics/
+    usage_collector = metrics.UsageCollector()
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+    async def log_usage():
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: {summary}")
+
+    ctx.add_shutdown_callback(log_usage)
+
+    # Create agent instance - keep it simple to ensure it works
+    agent_instance = Assistant()
+    logger.info("Agent initialized. Function tools should be automatically registered via @function_tool decorator.")
+
+
+    # # Add a virtual avatar to the session, if desired
+    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
+    # avatar = hedra.AvatarSession(
+    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
+    # )
+    # # Start the avatar and wait for it to join
+    # await avatar.start(session, room=ctx.room)
+
+    # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=GameMasterAgent(),
+        agent=agent_instance,
         room=ctx.room,
-        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
+        room_input_options=RoomInputOptions(
+            # For telephony applications, use `BVCTelephony` for best results
+            noise_cancellation=noise_cancellation.BVC(),
+        ),
     )
 
+    # Note: Transcriptions should be automatically forwarded by the session
+    # The frontend's useTranscriptions() hook will capture them
+    # If transcriptions don't appear, ensure the session is properly configured
+
+    # Join the room and connect to the user
     await ctx.connect()
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
