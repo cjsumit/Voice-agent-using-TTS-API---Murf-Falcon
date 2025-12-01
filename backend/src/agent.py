@@ -1,499 +1,338 @@
+"""
+Day 10 – Voice Improv Battle
+
+This file adapts the Day 9 voice Game Master agent into a voice-first improv
+show host called "Improv Battle". The original voice/STT/TTS/turn-detection/VAD
+plumbing and imports are preserved so it fits into the same voice runtime.
+
+Behaviour summary (implemented as tools exposed to the LLM):
+- start_show(name, max_rounds): initialise session state and introduce the show
+- next_scenario(): advance to the next improv scenario and put the host into awaiting_improv phase
+- record_performance(performance): save the player's improvisation, produce a host reaction
+- summarize_show(): produce a closing summary once rounds complete
+- stop_show(confirm=False): allow graceful early exit
+
+The GameMasterAgent uses these tools and acts as the high-energy improv host.
+"""
+
+import json
 import logging
-from typing import Annotated, Optional, Union
-from pydantic import Field
+import os
+import asyncio
+import uuid
+import random
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Dict, Optional, Annotated
 
 from dotenv import load_dotenv
+from pydantic import Field
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
     function_tool,
-    metrics,
-    tokenize,
     RunContext,
 )
+
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-from commerce import (
-    get_products, 
-    create_order, 
-    get_last_order, 
-    get_all_orders,
-    find_product_by_name,
-    add_to_cart,
-    get_cart,
-    remove_from_cart,
-    clear_cart,
-    checkout_cart,
-)
-
-logger = logging.getLogger("agent")
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("voice_improv_battle")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
 
 load_dotenv(".env.local")
 
+# -------------------------
+# Improv Scenarios (seeded)
+# -------------------------
+# Each scenario is a clear short prompt: role, situation, tension/hook
+SCENARIOS = [
+    "You are a barista who has to tell a customer that their latte is actually a portal to another dimension.",
+    "You are a time-travelling tour guide explaining modern smartphones to someone from the 1800s.",
+    "You are a restaurant waiter who must calmly tell a customer that their order has escaped the kitchen.",
+    "You are a customer trying to return an obviously cursed object to a very skeptical shop owner.",
+    "You are an overenthusiastic TV infomercial host selling a product that clearly does not work as advertised.",
+    "You are an astronaut who just discovered the ship's coffee machine has developed a personality.",
+    "You are a nervous wedding officiant who keeps getting the couple's names mixed up in ridiculous ways.",
+    "You are a ghost trying to give a performance review to a living employee.",
+    "You are a medieval king reacting to a very modern delivery service showing up at court.",
+    "You are a detective interrogating a suspect who only answers in awkward metaphors."
+]
 
-class Assistant(Agent):
-    def __init__(self) -> None:
+# -------------------------
+# Per-session Improv State
+# -------------------------
+@dataclass
+class Userdata:
+    player_name: Optional[str] = None
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    improv_state: Dict = field(default_factory=lambda: {
+        "current_round": 0,
+        "max_rounds": 3,
+        "rounds": [],  # each: {"scenario": str, "performance": str, "reaction": str}
+        "phase": "idle",  # "intro" | "awaiting_improv" | "reacting" | "done" | "idle"
+        "used_indices": []
+    })
+    history: List[Dict] = field(default_factory=list)
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def _pick_scenario(userdata: Userdata) -> str:
+    used = userdata.improv_state.get("used_indices", [])
+    candidates = [i for i in range(len(SCENARIOS)) if i not in used]
+    if not candidates:
+        # reset if we exhausted scenarios
+        userdata.improv_state["used_indices"] = []
+        candidates = list(range(len(SCENARIOS)))
+    idx = random.choice(candidates)
+    userdata.improv_state["used_indices"].append(idx)
+    return SCENARIOS[idx]
+
+
+def _host_reaction_text(performance: str) -> str:
+    # Lightweight heuristic to vary reaction tone
+    tones = ["supportive", "neutral", "mildly_critical"]
+    tone = random.choice(tones)
+    # Quick keyword detection to pick specific highlights (not exhaustive)
+    highlights = []
+    if any(w in performance.lower() for w in ("funny", "lol", "hahaha", "haha")):
+        highlights.append("great comedic timing")
+    if any(w in performance.lower() for w in ("sad", "cry", "tears")):
+        highlights.append("good emotional depth")
+    if any(w in performance.lower() for w in ("pause", "...")):
+        highlights.append("interesting use of silence")
+    if not highlights:
+        # fallback picks
+        highlights.append(random.choice(["nice character choices", "bold commitment", "unexpected twist"]))
+
+    chosen = random.choice(highlights)
+    if tone == "supportive":
+        return f"Love that — {chosen}! That was playful and clear. Nice work. Ready for the next one?"
+    elif tone == "neutral":
+        return f"Hmm — {chosen}. That landed in parts; you had interesting ideas. Let's try the next scene and lean into one choice."
+    else:  # mildly_critical
+        return f"Okay — {chosen}, but that felt a bit rushed. Try to make stronger choices next time. Don't be afraid to exaggerate."
+
+# -------------------------
+# Agent Tools
+# -------------------------
+@function_tool
+async def start_show(
+    ctx: RunContext[Userdata],
+    name: Annotated[Optional[str], Field(description="Player/contestant name (optional)", default=None)] = None,
+    max_rounds: Annotated[int, Field(description="Number of rounds (3-5 recommended)", default=3)] = 3,
+) -> str:
+    userdata = ctx.userdata
+    if name:
+        userdata.player_name = name.strip()
+    else:
+        # attempt to set player_name from history if present
+        userdata.player_name = userdata.player_name or "Contestant"
+
+    # clamp rounds
+    if max_rounds < 1:
+        max_rounds = 1
+    if max_rounds > 8:
+        max_rounds = 8
+
+    userdata.improv_state["max_rounds"] = int(max_rounds)
+    userdata.improv_state["current_round"] = 0
+    userdata.improv_state["rounds"] = []
+    userdata.improv_state["phase"] = "intro"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "start_show", "name": userdata.player_name})
+
+    intro = (
+        f"Welcome to Improv Battle! I'm your host — let's get ready to play."
+        f" {userdata.player_name or 'Contestant'}, we'll run {userdata.improv_state['max_rounds']} rounds. "
+        "Rules: I'll give you a quick scene, you'll improvise in character. When you're done say 'End scene' or pause — I'll react and move on. Have fun!"
+    )
+    # After intro, immediately provide first scenario for flow convenience
+    scenario = _pick_scenario(userdata)
+    userdata.improv_state["current_round"] = 1
+    userdata.improv_state["phase"] = "awaiting_improv"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "present_scenario", "round": 1, "scenario": scenario})
+
+    return intro + "\nRound 1: " + scenario + "\nStart improvising now!"
+
+
+@function_tool
+async def next_scenario(ctx: RunContext[Userdata]) -> str:
+    userdata = ctx.userdata
+    if userdata.improv_state.get("phase") == "done":
+        return "The show is already over. Say 'start show' to play again."
+
+    cur = userdata.improv_state.get("current_round", 0)
+    maxr = userdata.improv_state.get("max_rounds", 3)
+    if cur >= maxr:
+        userdata.improv_state["phase"] = "done"
+        return await summarize_show(ctx)
+
+    # advance
+    next_round = cur + 1
+    scenario = _pick_scenario(userdata)
+    userdata.improv_state["current_round"] = next_round
+    userdata.improv_state["phase"] = "awaiting_improv"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "present_scenario", "round": next_round, "scenario": scenario})
+    return f"Round {next_round}: {scenario}\nGo!"
+
+
+@function_tool
+async def record_performance(
+    ctx: RunContext[Userdata],
+    performance: Annotated[str, Field(description="Player's improv performance (transcribed text)")],
+) -> str:
+    userdata = ctx.userdata
+    if userdata.improv_state.get("phase") != "awaiting_improv":
+        # still accept performance but warn
+        userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "record_performance_out_of_phase"})
+
+    round_no = userdata.improv_state.get("current_round", 0)
+    scenario = userdata.history[-1].get("scenario") if userdata.history and userdata.history[-1].get("action") == "present_scenario" else "(unknown)"
+
+    reaction = _host_reaction_text(performance)
+
+    userdata.improv_state["rounds"].append({
+        "round": round_no,
+        "scenario": scenario,
+        "performance": performance,
+        "reaction": reaction,
+    })
+    userdata.improv_state["phase"] = "reacting"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "record_performance", "round": round_no})
+
+    # If we've reached max rounds, change to done after reaction
+    if round_no >= userdata.improv_state.get("max_rounds", 3):
+        userdata.improv_state["phase"] = "done"
+        closing = "\n" + reaction + "\nThat's the final round. "
+        closing += (await summarize_show(ctx))
+        return closing
+
+    # otherwise prompt for next round
+    closing = reaction + "\nWhen you're ready, say 'Next' or I'll give you the next scene."
+    return closing
+
+
+@function_tool
+async def summarize_show(ctx: RunContext[Userdata]) -> str:
+    userdata = ctx.userdata
+    rounds = userdata.improv_state.get("rounds", [])
+    if not rounds:
+        return "No rounds were played. Thanks for stopping by Improv Battle!"
+
+    # Simple summary heuristics: count supportive vs critical words, highlight standout moments
+    summary_lines = [f"Thanks for playing, {userdata.player_name or 'Contestant'}! Here's a short recap:"]
+    # highlight each round briefly
+    for r in rounds:
+        perf_snip = (r.get("performance") or "").strip()
+        if len(perf_snip) > 80:
+            perf_snip = perf_snip[:77] + "..."
+        summary_lines.append(f"Round {r.get('round')}: {r.get('scenario')} — You: '{perf_snip}' | Host: {r.get('reaction')}")
+
+    # aggregate a simple profile
+    mentions_character = sum(1 for r in rounds if any(w in (r.get('performance') or '').lower() for w in ('i am', "i'm", 'as a', 'character', 'role')))
+    mentions_emotion = sum(1 for r in rounds if any(w in (r.get('performance') or '').lower() for w in ('sad', 'angry', 'happy', 'love', 'cry', 'tears')))
+
+    profile = "You seem to be a player who "
+    if mentions_character > len(rounds) / 2:
+        profile += "commits to character choices"
+    elif mentions_emotion > 0:
+        profile += "brings emotional color to scenes"
+    else:
+        profile += "likes surprising beats and twists"
+
+    profile += ". Keep leaning into clear choices and stronger stakes."
+
+    summary_lines.append(profile)
+    summary_lines.append("Thanks for performing on Improv Battle — hope to see you again!")
+
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "summarize_show"})
+    return "\n".join(summary_lines)
+
+
+@function_tool
+async def stop_show(ctx: RunContext[Userdata], confirm: Annotated[bool, Field(description="Confirm stop", default=False)] = False) -> str:
+    userdata = ctx.userdata
+    if not confirm:
+        return "Are you sure you want to stop the show? Say 'stop show yes' to confirm."
+    userdata.improv_state["phase"] = "done"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "stop_show"})
+    return "Show stopped. Thanks for coming to Improv Battle!"
+
+
+# -------------------------
+# The Agent (Improv Host)
+# -------------------------
+class GameMasterAgent(Agent):
+    def __init__(self):
+        instructions = """
+        You are the host of a TV improv show called 'Improv Battle'.
+        Role: High-energy, witty, and clear about rules. Guide a single contestant through a series of short improv scenes.
+
+        Behavioural rules:
+            - Introduce the show and explain the rules at the start.
+            - Present clear scenario prompts (who you are, what's happening, what's the tension).
+            - Prompt the player to improvise and listen for an explicit "End scene" or accept an utterance passed to record_performance.
+            - After each scene, react in a varied, realistic way (supportive, neutral, mildly critical). Store the reaction.
+            - Run the configured number of rounds, then summarize the player's style.
+            - Keep turns short and TTS-friendly.
+        Use the provided tools: start_show, next_scenario, record_performance, summarize_show, stop_show.
+        """
         super().__init__(
-            instructions="""You are an Amazon shopping assistant. Concise, helpful. You can browse products and place orders. Always summarize the order price before confirming.
-            
-            You have access to these function tools:
-            - browse_products: Search, filter, and SORT products in the catalog. Use this when users ask about products, want to see items, browse the catalog, or request sorting. The browse_products function supports sorting with sort_by parameter: "price_asc" (cheapest first), "price_desc" (most expensive first), "rating_desc" (highest rated first), "name_asc" (A-Z), "name_desc" (Z-A). When users ask to sort, order by price, show cheapest/most expensive, or highest rated, ALWAYS use the sort_by parameter in browse_products.
-            - place_order: Place an order for a product. Always confirm the total price in INR before finalizing.
-            - get_last_order_info: Get information about the user's last order.
-            - add_to_cart: Add products to shopping cart. Use this when users want to add items to their cart.
-            - view_cart: View current cart contents. ALWAYS call this function when users ask "what's in my cart", "show my cart", "what did I add", or any question about their shopping cart.
-            - remove_from_cart: Remove items from cart. ALWAYS call this function when users ask to remove, delete, or take out items from their cart. Use the product name the user mentions.
-            - checkout_cart: Complete purchase from cart. Use this when users want to buy everything in their cart.
-            - get_order_history: View all past orders.
-            - get_product_details: Get detailed information about a specific product.
-            
-            When users ask about products, immediately call browse_products. When they want to buy something, use place_order or checkout_cart. 
-            When users ask about their cart (e.g., "what's in my cart", "show my cart"), ALWAYS call view_cart first.
-            When users want to remove items from cart, ALWAYS call remove_from_cart with the product name they mention.
-            When users ask to sort products (e.g., "sort by price", "show cheapest", "most expensive", "highest rated"), ALWAYS call browse_products with the appropriate sort_by parameter. DO NOT say you can't sort - you can sort using browse_products with sort_by parameter.
-            Always mention prices in Indian Rupees (₹).""",
+            instructions=instructions,
+            tools=[start_show, next_scenario, record_performance, summarize_show, stop_show],
         )
-    
 
-    @function_tool(description="Search and filter products from the catalog. All parameters are optional - provide only what you need.")
-    async def browse_products(
-        self,
-        context: RunContext,
-        search_term: Annotated[
-            Optional[str],
-            Field(description="Search by product name or keyword", default="")
-        ] = "",
-        category: Annotated[
-            Optional[str],
-            Field(description="Filter by category", default="")
-        ] = "",
-        max_price: Annotated[
-            Optional[int],
-            Field(description="Maximum price in INR", default=0)
-        ] = 0,
-        min_price: Annotated[
-            Optional[int],
-            Field(description="Minimum price in INR", default=0)
-        ] = 0,
-        sort_by: Annotated[
-            Optional[str],
-            Field(description="Sort option: price_asc, price_desc, rating_desc, name_asc", default="")
-        ] = "",
-    ) -> str:
-        """
-        Browse and filter products by search term, category, price range, or sorting preference.
-        
-        ALL PARAMETERS ARE OPTIONAL. You can provide any combination of:
-        - search_term: Search by product name or keyword (e.g., "camera", "echo")
-        - category: Filter by category (e.g., "electronics", "tablets", "smart-home")
-        - max_price: Maximum price in INR (e.g., 10000, 50000)
-        - min_price: Minimum price in INR
-        - sort_by: Sort option - "price_asc" (low to high), "price_desc" (high to low), "rating_desc" (best rated), "name_asc" (alphabetical)
-        
-        Examples:
-        - browse_products(search_term="camera") → finds all cameras
-        - browse_products(max_price=30000) → products under ₹30,000
-        - browse_products(search_term="sony", category="electronics") → Sony products in electronics
-        - browse_products(sort_by="price_asc") → cheapest products first
-        - browse_products(search_term="camera", max_price=10000) → cameras under ₹10,000
-        """
-        try:
-            logger.info(
-                f"browse_products called with: search_term={search_term}, "
-                f"category={category}, max_price={max_price}, min_price={min_price}, "
-                f"sort_by={sort_by}"
-            )
-
-            # Normalize empty strings and 0 to None for optional parameters
-            # This allows the LLM to omit parameters without validation errors
-            search_term = str(search_term).strip() if search_term else None
-            category = str(category).strip().lower() if category else None
-            max_price = int(max_price) if max_price and max_price > 0 else None
-            min_price = int(min_price) if min_price and min_price > 0 else None
-            sort_by = str(sort_by).strip() if sort_by else None
-            
-            # Call commerce layer with all parameters (handles None correctly)
-            filtered_products = get_products(
-                search_term=search_term,
-                category=category,
-                max_price=max_price,
-                min_price=min_price,
-                sort_by=sort_by
-            )
-
-            logger.info(f"Found {len(filtered_products)} products")
-
-            if not filtered_products:
-                return "Sorry, I couldn't find any products matching your criteria."
-
-            # ✅ Send filter metadata to frontend via LiveKit data channel
-            # This keeps the UI in sync with what the agent found
-            # Only include non-empty parameters
-            filter_params = []
-            if search_term and search_term.strip():
-                filter_params.append(f"search_term={search_term.strip()}")
-            if category and category.strip():
-                filter_params.append(f"category={category.strip()}")
-            if max_price and max_price > 0:
-                filter_params.append(f"max_price={max_price}")
-            if min_price and min_price > 0:
-                filter_params.append(f"min_price={min_price}")
-            if sort_by and sort_by.strip() and sort_by.strip() != 'default':
-                filter_params.append(f"sort_by={sort_by.strip()}")
-            
-            if filter_params:
-                filter_message = f"[FILTER:{'&'.join(filter_params)}]"
-                
-                try:
-                    import asyncio
-                    async def send_metadata():
-                        try:
-                            await context.room.local_participant.publish_data(
-                                filter_message.encode("utf-8"),
-                                topic="chat",
-                                reliable=True
-                            )
-                            logger.info(f"✅ Filter metadata sent to frontend: {filter_message}")
-                        except Exception as e:
-                            logger.warning(f"❌ Could not send metadata via data channel: {e}", exc_info=True)
-                    
-                    # Don't await - run in background
-                    asyncio.create_task(send_metadata())
-                except Exception as e:
-                    logger.warning(f"❌ Could not create metadata send task: {e}", exc_info=True)
-            else:
-                logger.info("ℹ️ No filter parameters to send (all empty)")
-
-            # Format response for agent to speak
-            product_names = ", ".join([
-                f"*{p['name']}* (₹{p['price']})"
-                for p in filtered_products[:5]
-            ])
-
-            return (
-                f"Found {len(filtered_products)} products. "
-                f"Here are some options: {product_names}"
-            )
-        except Exception as e:
-            logger.error("=" * 50)
-            logger.error(f"❌ ERROR in browse_products: {e}", exc_info=True)
-            logger.error(f"Error type: {type(e).__name__}")
-            logger.error(f"Error details - search_term={search_term!r} (type: {type(search_term)}), category={category!r} (type: {type(category)}), max_price={max_price} (type: {type(max_price)}), min_price={min_price} (type: {type(min_price)}), sort_by={sort_by!r} (type: {type(sort_by)})")
-            logger.error("=" * 50)
-            # Return a user-friendly error message
-            return f"I encountered an error while searching for products: {str(e)}. Please try again with simpler search terms."
-
-    @function_tool(description="Place an order for a product")
-    async def place_order(
-        self,
-        context: RunContext,
-        product_name_or_id: str,
-        quantity: Optional[int] = 1,
-    ) -> str:
-        """
-        Place a new order for a product.
-        
-        Example: place_order(product_name_or_id="Echo Dot", quantity=2)
-        """
-        logger.info(f"Placing order: product_name_or_id={product_name_or_id}, quantity={quantity}")
-
-        # Try to find product by name first
-        product = find_product_by_name(product_name_or_id)
-        
-        if product:
-            product_id = product["id"]
-            logger.info(f"Found product by name: {product_name_or_id} -> {product_id}")
-        else:
-            # Assume it's already a product ID
-            product_id = product_name_or_id
-            logger.info(f"Using as product ID: {product_id}")
-
-        try:
-            order = create_order(product_id=product_id, quantity=quantity)
-            logger.info(f"Order created successfully: {order['id']}")
-            return f"Order confirmed! Order ID: {order['id']}. You ordered {quantity}x {order['items'][0]['product_name']} for a total of ₹{order['total']:,} {order['currency']}. Your order has been placed and will appear in the Live Order Status panel. Thank you for your purchase!"
-        except ValueError as e:
-            # If product ID lookup failed, try one more time with name search
-            product = find_product_by_name(product_name_or_id)
-            if product:
-                try:
-                    order = create_order(product_id=product["id"], quantity=quantity)
-                    return f"Order confirmed! Order ID: {order['id']}. You ordered {quantity}x {order['items'][0]['product_name']} for a total of ₹{order['total']:,} {order['currency']}. Thank you for your purchase!"
-                except ValueError as ve:
-                    logger.error(f"Error creating order: {ve}")
-                    return f"I found the product '{product['name']}' but couldn't create the order. Please try again."
-            logger.error(f"Product not found: {product_name_or_id}, error: {e}")
-            return f"I couldn't find a product matching '{product_name_or_id}'. Please try using the exact product name or browse products first to see available items."
-        except Exception as e:
-            logger.error(f"Unexpected error in place_order: {e}", exc_info=True)
-            return f"I encountered an error while processing your order. Please try again or browse products first to see available items."
-
-    @function_tool(description="View your most recent order")
-    async def get_last_order_info(self, context: RunContext) -> str:
-        """Get information about your most recent order."""
-        logger.info("Getting last order info")
-
-        try:
-            order = get_last_order()
-            if not order:
-                return "You haven't placed any orders yet."
-
-            items_summary = ", ".join([
-                f"{item['quantity']}x {item['product_name']}"
-                for item in order.get('items', [])
-            ])
-
-            return (
-                f"📦 Your Last Order:\n"
-                f"Order ID: {order['id']}\n"
-                f"Items: {items_summary}\n"
-                f"Total: ₹{order['total']:,}\n"
-                f"Status: {order['status']}\n"
-                f"Placed: {order['created_at']}"
-            )
-        except Exception as e:
-            logger.error(f"Error getting last order: {str(e)}")
-            return "Sorry, I couldn't retrieve your order."
-
-    @function_tool(description="View your order history")
-    async def get_order_history(
-        self,
-        context: RunContext,
-        limit: Optional[int] = 5,
-    ) -> str:
-        """Get your recent orders."""
-        logger.info("Getting order history")
-
-        orders = get_all_orders()
-        if not orders:
-            return "You have no orders yet."
-
-        recent = orders[-limit:] if limit else orders
-        
-        order_summary = "\n".join([
-            f"  • Order #{i+1}: {order['id']} → ₹{order['total']:,} ({order['status']})"
-            for i, order in enumerate(reversed(recent))
-        ])
-        
-        return f"📜 Your Recent Orders:\n{order_summary}"
-
-    @function_tool(description="Add a product to your shopping cart")
-    async def add_to_cart(
-        self,
-        context: RunContext,
-        product_name_or_id: str,
-        quantity: Optional[int] = 1,
-    ) -> str:
-        """Add items to your cart."""
-        logger.info(f"Adding to cart: product_name_or_id={product_name_or_id}, quantity={quantity}")
-
-        # Find product by name
-        product = find_product_by_name(product_name_or_id)
-        if not product:
-            return f"I couldn't find a product matching '{product_name_or_id}'. Please browse products first to see available items."
-
-        try:
-            result = add_to_cart(product["id"], quantity)
-            cart = result["cart"]
-            total = sum(item["unit_amount"] * item["quantity"] for item in cart)
-            return f"{result['message']}. Your cart now has {len(cart)} item(s) with a total of ₹{total:,}."
-        except Exception as e:
-            logger.error(f"Error adding to cart: {e}", exc_info=True)
-            return f"I encountered an error adding '{product_name_or_id}' to your cart. Please try again."
-
-    @function_tool(description="View your shopping cart")
-    async def view_cart(self, context: RunContext) -> str:
-        """Get current cart contents and total."""
-        logger.info("Viewing cart")
-
-        cart = get_cart()
-        if not cart or len(cart) == 0:
-            return "Your cart is empty. Add some products to get started!"
-
-        items_summary = "\n".join([
-            f"  • {item['quantity']}x {item['product_name']} @ ₹{item['unit_amount']} each = ₹{item['quantity'] * item['unit_amount']:,}"
-            for item in cart
-        ])
-
-        total = sum(item['quantity'] * item['unit_amount'] for item in cart)
-
-        return f"🛒 Cart Contents:\n{items_summary}\n\nTotal: ₹{total:,}"
-
-    @function_tool(description="Remove a product from your cart")
-    async def remove_from_cart(
-        self,
-        context: RunContext,
-        product_name_or_id: str,
-    ) -> str:
-        """Remove an item from your shopping cart."""
-        logger.info(f"Removing from cart: product_name_or_id={product_name_or_id}")
-
-        # Find product by name
-        product = find_product_by_name(product_name_or_id)
-        if not product:
-            return f"I couldn't find a product matching '{product_name_or_id}' in your cart."
-
-        try:
-            result = remove_from_cart(product["id"])
-            cart = result["cart"]
-            if cart:
-                total = sum(item["unit_amount"] * item["quantity"] for item in cart)
-                return f"{result['message']}. Your cart now has {len(cart)} item(s) with a total of ₹{total:,}."
-            else:
-                return f"{result['message']}. Your cart is now empty."
-        except Exception as e:
-            logger.error(f"Error removing from cart: {e}", exc_info=True)
-            return f"I encountered an error removing '{product_name_or_id}' from your cart. Please try again."
-
-    @function_tool(description="Checkout and place order from your cart")
-    async def checkout_cart(self, context: RunContext) -> str:
-        """Convert cart to order and proceed with checkout."""
-        logger.info("Checking out cart")
-
-        try:
-            cart = get_cart()
-            if not cart or len(cart) == 0:
-                return "Your cart is empty. Add products before checkout."
-
-            order = checkout_cart()
-            logger.info(f"Checkout completed: {order['id']}")
-
-            items_count = sum(item['quantity'] for item in order['items'])
-            return (
-                f"✅ Checkout successful!\n"
-                f"Order ID: {order['id']}\n"
-                f"Items: {items_count}\n"
-                f"Total: ₹{order['total']:,}\n"
-                f"Status: {order['status']}"
-            )
-        except Exception as e:
-            logger.error(f"Error during checkout: {str(e)}")
-            return "Sorry, checkout failed. Please try again."
-
-    @function_tool(description="Get detailed information about a product")
-    async def get_product_details(
-        self,
-        context: RunContext,
-        product_name_or_id: str,
-    ) -> str:
-        """Get complete details about a specific product."""
-        logger.info(f"Getting product details: product_name_or_id={product_name_or_id}")
-
-        try:
-            product = find_product_by_name(product_name_or_id)
-            if not product:
-                return f"Product not found."
-
-            return (
-                f"📦 {product['name']}\n"
-                f"💵 Price: ₹{product['price']:,}\n"
-                f"📂 Category: {product['category']}\n"
-                f"⭐ Rating: {product['rating']}/5 ({product['reviews']:,} reviews)\n"
-                f"📝 Description: {product['description']}"
-            )
-        except Exception as e:
-            logger.error(f"Error getting product details: {str(e)}")
-            return "Sorry, I couldn't retrieve product details."
-
-
+# -------------------------
+# Entrypoint & Prewarm
+# -------------------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
 
 
 async def entrypoint(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
+    ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info("\n" + "🎭" * 6)
+    logger.info("🚀 STARTING VOICE IMPROV HOST — Improv Battle")
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, AssemblyAI, and the LiveKit turn detector
+    userdata = Userdata()
+
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=deepgram.STT(model="nova-3"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
-        llm=google.LLM(
-                model="gemini-2.5-flash",
-            ),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+        llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-matthew", 
-            style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            voice="en-US-marcus",
+            style="Conversational",
             text_pacing=True,
         ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
+        vad=ctx.proc.userdata.get("vad"),
+        userdata=userdata,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
-
-    # Metrics collection, to measure pipeline performance
-    # For more information, see https://docs.livekit.io/agents/build/metrics/
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # Create agent instance - keep it simple to ensure it works
-    agent_instance = Assistant()
-    logger.info("Agent initialized. Function tools should be automatically registered via @function_tool decorator.")
-
-
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Start the session, which initializes the voice pipeline and warms up the models
+    # Start with the Improv Host agent
     await session.start(
-        agent=agent_instance,
+        agent=GameMasterAgent(),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            # For telephony applications, use `BVCTelephony` for best results
-            noise_cancellation=noise_cancellation.BVC(),
-        ),
+        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
 
-    # Note: Transcriptions should be automatically forwarded by the session
-    # The frontend's useTranscriptions() hook will capture them
-    # If transcriptions don't appear, ensure the session is properly configured
-
-    # Join the room and connect to the user
     await ctx.connect()
 
 
